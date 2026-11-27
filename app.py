@@ -180,15 +180,15 @@ def color_slots(selected: list, universe: list) -> dict:
 CSS = """
 <style>
 .block-container {padding-top: 2.2rem;}
-.ct {font-size: 15px; font-weight: 600; color: #191919; margin: 2px 0 0 0;}
-.cs {font-size: 12.5px; color: #666666; margin: 0 0 6px 0;}
+.ct {font-size: 15px; font-weight: 600; color: inherit; margin: 2px 0 0 0;}
+.cs {font-size: 12.5px; opacity: .7; margin: 0 0 6px 0;}
 .kpi-row {display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 12px; margin: 6px 0 22px 0;}
-.kpi {background: #ffffff; border: 1px solid rgba(11,11,11,0.10); border-radius: 12px; padding: 14px 18px;}
-.kpi .lab {color: #666666; font-size: 13px; margin-bottom: 2px;}
-.kpi .val {color: #191919; font-size: 28px; font-weight: 600; line-height: 1.25;}
+.kpi {background: rgba(128,128,128,0.08); border: 1px solid rgba(128,128,128,0.25); border-radius: 12px; padding: 14px 18px;}
+.kpi .lab {opacity: .7; font-size: 13px; margin-bottom: 2px;}
+.kpi .val {color: inherit; font-size: 28px; font-weight: 600; line-height: 1.25;}
 .kpi.hero .val {font-size: 48px; line-height: 1.15;}
-.kpi .unit {color: #666666; font-size: 14px; font-weight: 400; margin-left: 6px;}
-.kpi .sub {color: #666666; font-size: 12.5px; margin-top: 2px;}
+.kpi .unit {opacity: .7; font-size: 14px; font-weight: 400; margin-left: 6px;}
+.kpi .sub {opacity: .7; font-size: 12.5px; margin-top: 2px;}
 @media (max-width: 900px) {.kpi-row {grid-template-columns: 1fr 1fr;}}
 </style>
 """
@@ -474,14 +474,21 @@ with st.sidebar:
     how = st.radio("그룹 평균 방식", [W_AVG, S_AVG, S_MED])
     n_recent = st.slider("‘최근 N개년 평균’의 N", 2, 5, 3)
 
-    products = sorted(fact_all["product"].unique())
-    default_products = [p for p in products if p.endswith(("/개별난방용", "/취사난방용"))
-                        and p.startswith("가스요금")]
-    sel_products = st.multiselect(
-        "상품(용도)", products, default=default_products,
-        help="취사용은 난방이 없어 사용량이 훨씬 작고, 중앙난방용은 단지 단위 계량이라 "
-             "세대당 값이 크게 달라서 기본에서 제외했습니다.",
+    usages = [u for u in ["개별난방용", "취사난방용", "취사용", "중앙난방용"]
+              if u in set(fact_all["product_name"])]
+    usages += sorted(set(fact_all["product_name"]) - set(usages))
+    sel_usages = st.multiselect(
+        "용도", usages, default=[u for u in ["개별난방용", "취사난방용"] if u in usages],
+        help="개별난방용·취사난방용: 세대별 난방 포함. 취사용은 난방이 없어 사용량이 훨씬 작고, "
+             "중앙난방용은 단지 단위 계량이라 세대당 값이 크게 달라 기본에서 제외했습니다.",
     )
+    cats = sorted(fact_all["category"].dropna().unique())
+    sel_cats = st.multiselect(
+        "요금 구분", cats, default=[c for c in ["가스요금"] if c in cats],
+        help="가스요금: 일반 요금 적용분 / 우선사용: 우선사용 적용분",
+    )
+    sel_products = [p for p in fact_all["product"].unique()
+                    if p.split("/", 1)[-1] in sel_usages and p.split("/", 1)[0] in sel_cats]
     sigungus = sorted(master["sigungu"].dropna().unique())
     sel_sigungu = st.multiselect("구·군 (비우면 전체)", sigungus)
 
@@ -494,7 +501,7 @@ with st.sidebar:
         st.rerun()
 
 if not sel_products:
-    st.info("사이드바에서 상품(용도)을 하나 이상 선택하세요.")
+    st.info("사이드바에서 용도와 요금 구분을 하나 이상 선택하세요.")
     st.stop()
 
 val_col = "usage_m3" if unit == "m³" else "usage_mj"
@@ -714,11 +721,11 @@ def render_map_tab():
     for b in range(nb):
         sub = m[m["bin"] == b]["값"]
         parts.append(
-            f"<span style='display:inline-flex;align-items:center;margin-right:16px;font-size:12.5px;color:#191919'>"
+            f"<span style='display:inline-flex;align-items:center;margin-right:16px;font-size:12.5px'>"
             f"<span style='width:12px;height:12px;border-radius:50%;background:{ramp[b]};margin-right:6px'></span>"
             f"{sub.min():,.0f} ~ {sub.max():,.0f}</span>"
         )
-    st.markdown("".join(parts) + f"<span style='font-size:12.5px;color:#666'>({unit_label})</span>",
+    st.markdown("".join(parts) + f"<span style='font-size:12.5px;opacity:.7'>({unit_label})</span>",
                 unsafe_allow_html=True)
     st.caption(f"좌표가 있고 12개월 데이터가 있는 단지 {len(m):,}개만 표시됩니다.")
 
