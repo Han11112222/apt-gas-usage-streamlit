@@ -1,6 +1,6 @@
 streamlit
 pandas
-altair
+altair>=5
 google-cloud-bigquery
 db-dtypes
 pyarrow
