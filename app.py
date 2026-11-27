@@ -2,10 +2,10 @@
 공동주택 세대당 가스 사용량 분석 대시보드 (Streamlit + BigQuery)
 
 실행:  streamlit run app.py
-필요:  pip install streamlit pandas altair google-cloud-bigquery db-dtypes pyarrow
+필요:  pip install streamlit pandas "altair>=5" google-cloud-bigquery db-dtypes pyarrow
 
 인증(둘 중 하나)
-  1) .streamlit/secrets.toml 에 [gcp_service_account] 로 서비스계정 JSON 내용을 넣기
+  1) .streamlit/secrets.toml (또는 Streamlit Cloud의 Secrets)에 [gcp_service_account] 입력
   2) 또는 로컬에서  gcloud auth application-default login  후 실행
 """
 
@@ -33,6 +33,180 @@ S_AVG = "단지 단순평균"
 S_MED = "단지 중앙값"
 
 st.set_page_config(page_title="공동주택 가스 사용량", page_icon="🔥", layout="wide")
+
+# ──────────────────────────────────────────────────────────────
+# 디자인 (색·차트 스타일)
+# ──────────────────────────────────────────────────────────────
+# charts-begin
+INK = "#191919"      # 본문 글자
+INK2 = "#666666"     # 보조 글자 (축, 범례, 부제)
+GRID = "#e7e7e7"     # 눈금선
+AXIS = "#c2c2c2"     # 기준선
+SURFACE = "#ffffff"  # 차트 바탕
+# 범주형 색: 순서가 고정된 8색 (색각이상 검증 통과 순서, 9번째부터는 쓰지 않음)
+SERIES = ["#257de0", "#f47230", "#00b894", "#f2a600", "#ee7fac", "#008a17", "#6a4ce2", "#ec4647"]
+FONT = 'system-ui, -apple-system, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif'
+
+
+def style(chart: alt.TopLevelMixin) -> alt.TopLevelMixin:
+    """모든 차트에 같은 모양(얇은 눈금, 조용한 축, 위쪽 범례)을 입힌다."""
+    return (
+        chart.configure(background=SURFACE)
+        .configure_view(stroke=None)
+        .configure_axis(
+            domainColor=AXIS, tickColor=AXIS, gridColor=GRID, gridWidth=1,
+            labelColor=INK2, titleColor=INK2, labelFont=FONT, titleFont=FONT,
+            labelFontSize=12, titleFontSize=12, titleFontWeight="normal", labelPadding=6,
+        )
+        .configure_legend(
+            orient="top", direction="horizontal", title=None, labelColor=INK, labelFont=FONT,
+            labelFontSize=12, symbolStrokeWidth=3, symbolSize=120, columnPadding=14, padding=0,
+        )
+    )
+
+
+def bar_chart(df: pd.DataFrame, unit_label: str, ref=None, height=320):
+    """단일 계열 막대 (열: 그룹, 값). 그룹이 8개 초과면 가로 막대."""
+    order = df["그룹"].tolist()
+    n = len(order)
+    horizontal = n > 8
+    vmax = float(df["값"].abs().max()) if n else 0
+    fmt = ",.0f" if vmax >= 100 else ",.1f"
+    tip = [alt.Tooltip("그룹:N", title="구분"), alt.Tooltip("값:Q", title=unit_label, format=",.1f")]
+
+    if horizontal:
+        enc = dict(
+            y=alt.Y("그룹:N", sort=order, title=None, axis=alt.Axis(grid=False, ticks=False, labelLimit=180)),
+            x=alt.X("값:Q", title=unit_label, axis=alt.Axis(format=",.0f", grid=True)),
+            tooltip=tip,
+        )
+        bars = alt.Chart(df).mark_bar(size=16, color=SERIES[0], cornerRadiusTopRight=4, cornerRadiusBottomRight=4).encode(**enc)
+        layers = [bars]
+        if n <= 14:
+            layers.append(
+                alt.Chart(df).mark_text(align="left", dx=6, color=INK, font=FONT, fontSize=12)
+                .encode(y=alt.Y("그룹:N", sort=order), x="값:Q", text=alt.Text("값:Q", format=fmt))
+            )
+        if ref is not None:
+            layers.append(alt.Chart(pd.DataFrame({"r": [ref]})).mark_rule(color=INK2, strokeWidth=1).encode(x="r:Q"))
+        h = max(height, n * 26 + 60)
+    else:
+        enc = dict(
+            x=alt.X("그룹:N", sort=order, title=None, axis=alt.Axis(grid=False, ticks=False, labelAngle=0, labelLimit=140)),
+            y=alt.Y("값:Q", title=unit_label, axis=alt.Axis(format=",.0f")),
+            tooltip=tip,
+        )
+        bars = alt.Chart(df).mark_bar(size=24, color=SERIES[0], cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(**enc)
+        layers = [bars]
+        layers.append(
+            alt.Chart(df).mark_text(baseline="bottom", dy=-6, color=INK, font=FONT, fontSize=12)
+            .encode(x=alt.X("그룹:N", sort=order), y="값:Q", text=alt.Text("값:Q", format=fmt))
+        )
+        if ref is not None:
+            layers.append(alt.Chart(pd.DataFrame({"r": [ref]})).mark_rule(color=INK2, strokeWidth=1).encode(y="r:Q"))
+        h = height
+    return style(alt.layer(*layers).properties(height=h))
+
+
+def line_chart(long_df: pd.DataFrame, unit_label: str, slots: dict, x_title=None, height=320):
+    """연도별 추이 (열: 연도, 그룹, 값). slots: {그룹: 색}. 선 2px, 점 8px + 흰 테두리."""
+    groups = list(slots.keys())
+    scale = alt.Scale(domain=groups, range=[slots[g] for g in groups])
+    color = alt.Color("그룹:N", scale=scale, legend=alt.Legend(title=None) if len(groups) > 1 else None)
+    base = alt.Chart(long_df).encode(
+        x=alt.X("연도:O", title=x_title, axis=alt.Axis(grid=False, labelAngle=0)),
+        y=alt.Y("값:Q", title=unit_label, scale=alt.Scale(zero=False, nice=True), axis=alt.Axis(format=",.0f")),
+        color=color,
+    )
+    tip = [alt.Tooltip("그룹:N", title="구분"), alt.Tooltip("연도:O"), alt.Tooltip("값:Q", title=unit_label, format=",.1f")]
+    lines = base.mark_line(strokeWidth=2, strokeJoin="round", strokeCap="round")
+    dots = base.mark_circle(size=64, opacity=1, stroke=SURFACE, strokeWidth=2)
+    hit = base.mark_circle(size=420, opacity=0).encode(tooltip=tip)  # 호버 영역을 크게
+    return style(alt.layer(lines, dots, hit).properties(height=height))
+
+
+def grouped_bar_chart(long_df: pd.DataFrame, unit_label: str, slots: dict, height=320):
+    """여러 단지의 연도별 막대 (열: 연도, 단지, 값)."""
+    names = list(slots.keys())
+    scale = alt.Scale(domain=names, range=[slots[g] for g in names])
+    ch = (
+        alt.Chart(long_df)
+        .mark_bar(size=14, cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+        .encode(
+            x=alt.X("연도:O", title=None, axis=alt.Axis(grid=False, ticks=False, labelAngle=0)),
+            xOffset=alt.XOffset("단지:N", sort=names),
+            y=alt.Y("값:Q", title=unit_label, axis=alt.Axis(format=",.0f")),
+            color=alt.Color("단지:N", scale=scale, legend=alt.Legend(title=None)),
+            tooltip=[alt.Tooltip("단지:N"), alt.Tooltip("연도:O"), alt.Tooltip("값:Q", title=unit_label, format=",.1f")],
+        )
+        .properties(height=height)
+    )
+    return style(ch)
+
+
+def monthly_chart(long_df: pd.DataFrame, unit_label: str, slots: dict, height=320):
+    """월별 추이 (열: 월(날짜), 단지, 값). 점이 많아 마우스를 올린 점만 표시."""
+    names = list(slots.keys())
+    scale = alt.Scale(domain=names, range=[slots[g] for g in names])
+    hover = alt.selection_point(fields=["월", "단지"], on="mouseover", clear="mouseout", empty=False)
+    base = alt.Chart(long_df).encode(
+        x=alt.X("월:T", title=None, axis=alt.Axis(grid=False, format="%Y-%m", labelAngle=0, tickCount=8)),
+        y=alt.Y("값:Q", title=unit_label, scale=alt.Scale(zero=False, nice=True), axis=alt.Axis(format=",.0f")),
+        color=alt.Color("단지:N", scale=scale, legend=alt.Legend(title=None) if len(names) > 1 else None),
+    )
+    lines = base.mark_line(strokeWidth=2, strokeJoin="round", strokeCap="round")
+    dots = (
+        base.mark_circle(size=90, stroke=SURFACE, strokeWidth=2)
+        .encode(
+            opacity=alt.condition(hover, alt.value(1), alt.value(0)),
+            tooltip=[alt.Tooltip("단지:N"), alt.Tooltip("월:T", format="%Y-%m"),
+                     alt.Tooltip("값:Q", title=unit_label, format=",.1f")],
+        )
+        .add_params(hover)
+    )
+    return style(alt.layer(lines, dots).properties(height=height))
+
+
+def color_slots(selected: list, universe: list) -> dict:
+    """색은 '대상(그룹)'을 따라간다.
+    전체 그룹이 8개 이하이면 전체 목록 순서대로 고정(필터를 바꿔도 색이 안 바뀜),
+    8개를 넘으면 선택한 순서대로 앞의 색부터 배정한다(색을 돌려쓰지 않음)."""
+    if len(universe) <= len(SERIES):
+        return {g: SERIES[universe.index(g)] for g in selected}
+    return {g: SERIES[i] for i, g in enumerate(selected[: len(SERIES)])}
+# charts-end
+
+CSS = """
+<style>
+.block-container {padding-top: 2.2rem;}
+.ct {font-size: 15px; font-weight: 600; color: #191919; margin: 2px 0 0 0;}
+.cs {font-size: 12.5px; color: #666666; margin: 0 0 6px 0;}
+.kpi-row {display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 12px; margin: 6px 0 22px 0;}
+.kpi {background: #ffffff; border: 1px solid rgba(11,11,11,0.10); border-radius: 12px; padding: 14px 18px;}
+.kpi .lab {color: #666666; font-size: 13px; margin-bottom: 2px;}
+.kpi .val {color: #191919; font-size: 28px; font-weight: 600; line-height: 1.25;}
+.kpi.hero .val {font-size: 48px; line-height: 1.15;}
+.kpi .unit {color: #666666; font-size: 14px; font-weight: 400; margin-left: 6px;}
+.kpi .sub {color: #666666; font-size: 12.5px; margin-top: 2px;}
+@media (max-width: 900px) {.kpi-row {grid-template-columns: 1fr 1fr;}}
+</style>
+"""
+
+
+def chart_title(title: str, sub: str = ""):
+    st.markdown(f"<div class='ct'>{title}</div><div class='cs'>{sub}</div>", unsafe_allow_html=True)
+
+
+def kpi_row(items: list):
+    """items: [(라벨, 값, 단위, 보조설명, hero 여부)]"""
+    cells = []
+    for lab, val, unit, sub, hero in items:
+        u = f"<span class='unit'>{unit}</span>" if unit else ""
+        cells.append(
+            f"<div class='kpi{' hero' if hero else ''}'><div class='lab'>{lab}</div>"
+            f"<div class='val'>{val}{u}</div><div class='sub'>{sub}</div></div>"
+        )
+    st.markdown(CSS + "<div class='kpi-row'>" + "".join(cells) + "</div>", unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -206,9 +380,9 @@ def show_df(data, **kw):
 
 def show_alt(chart):
     try:
-        st.altair_chart(chart, width="stretch")
+        st.altair_chart(chart, theme=None, width="stretch")
     except TypeError:
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, theme=None, use_container_width=True)
 
 
 def fmt_table(df: pd.DataFrame):
@@ -219,10 +393,20 @@ def fmt_table(df: pd.DataFrame):
     return sty
 
 
+def to_long(wide: pd.DataFrame, value_cols: list, groups: list) -> pd.DataFrame:
+    """행=그룹, 열=연도 표를 (연도, 그룹, 값) 세로 형태로."""
+    w = wide.loc[groups, value_cols].copy()
+    w.index.name = "그룹"
+    long = w.reset_index().melt(id_vars="그룹", var_name="연도", value_name="값").dropna()
+    long["연도"] = long["연도"].astype(str)
+    return long
+
+
 # ──────────────────────────────────────────────────────────────
 # 화면 공통 컴포넌트
 # ──────────────────────────────────────────────────────────────
-def render_group_tab(ap, group_col, how, n_recent, unit_label, order=None, key=""):
+def render_group_tab(ap, group_col, how, n_recent, unit_label, order=None, key="",
+                     sort_by_value=False, overall=None):
     res = summarize(ap, group_col, how, n_recent, order)
     if res is None:
         st.warning("12개월이 모두 채워진 연도 데이터가 없습니다. 필터를 확인하세요.")
@@ -230,35 +414,37 @@ def render_group_tab(ap, group_col, how, n_recent, unit_label, order=None, key="
     tbl, roll, cal = res
     avg_col = [c for c in tbl.columns if c.startswith("최근") and "개년 평균" in c][0]
 
-    left, right = st.columns([1, 1])
+    left, right = st.columns([1, 1], gap="large")
     with left:
-        st.markdown(f"**{avg_col}** · {unit_label}")
-        chart_df = tbl[[avg_col]].reset_index()
-        chart_df.columns = ["그룹", "값"]
-        chart = (
-            alt.Chart(chart_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("그룹:N", sort=list(tbl.index), title=None),
-                y=alt.Y("값:Q", title=unit_label),
-                tooltip=["그룹", alt.Tooltip("값:Q", format=",.1f")],
-            )
-            .properties(height=320)
-        )
-        show_alt(chart)
+        bar_df = tbl[[avg_col]].dropna().reset_index()
+        bar_df.columns = ["그룹", "값"]
+        if sort_by_value:
+            bar_df = bar_df.sort_values("값", ascending=False)
+        sub = unit_label + (f" · 회색 선 = 전체 평균 {overall:,.1f}" if overall is not None else "")
+        chart_title(avg_col, sub)
+        show_alt(bar_chart(bar_df, unit_label, ref=overall))
     with right:
-        st.markdown(f"**연도별 추이** · {unit_label}")
-        yearly = tbl[cal].T
-        yearly.index.name = "연도"
-        st.line_chart(yearly, height=320)
+        groups_all = list(tbl.index)
+        default = groups_all if len(groups_all) <= len(SERIES) else groups_all[:5]
+        chart_title("연도별 추이", unit_label)
+        picked = st.multiselect(
+            "표시할 그룹 (최대 8개)", groups_all, default=default, max_selections=len(SERIES),
+            key=f"trend_{key}_{abs(hash(tuple(groups_all))) % 10**8}",
+        )
+        if picked:
+            slots = color_slots(picked, groups_all)
+            show_alt(line_chart(to_long(tbl, cal, picked), unit_label, slots))
+        else:
+            st.info("표시할 그룹을 선택하세요.")
 
     st.markdown("**연도별 값 / 최근 평균 / 3개년 이동평균**")
     show_df(fmt_table(tbl))
 
     with st.expander("3개년 이동평균 추이 (각 연도 기준 직전 3년 평균)"):
-        r = roll.T
-        r.index.name = "연도"
-        st.line_chart(r.dropna(how="all"), height=300)
+        roll_cols = [c for c in cal if roll[c].notna().any()]
+        if roll_cols and picked:
+            slots = color_slots(picked, groups_all)
+            show_alt(line_chart(to_long(roll, roll_cols, picked), unit_label, slots))
         show_df(roll.style.format("{:,.1f}", na_rep="-"))
 
     csv = tbl.to_csv().encode("utf-8-sig")
@@ -317,11 +503,37 @@ ap_all = build_apt_period(fact, val_col, per_month)
 ap_all = ap_all.merge(master, on="apartment_code", how="inner")
 ap = ap_all[ap_all["sigungu"].isin(sel_sigungu)] if sel_sigungu else ap_all
 
+if ap.empty:
+    st.warning("조건에 맞는 데이터가 없습니다. 상품·구·군 선택을 확인하세요.")
+    st.stop()
+
+# ── 요약 카드 ────────────────────────────────────────────────
 last_month = fact_all["sales_ym"].max().strftime("%Y-%m")
-c1, c2, c3 = st.columns(3)
-c1.metric("분석 단지 수", f"{ap['apartment_code'].nunique():,}")
-c2.metric("데이터 최종 월", last_month)
-c3.metric("단위", unit_label)
+ov_tbl = group_period_table(ap.assign(_all="전체"), "_all", how)
+ov_cal = calendar_cols(ov_tbl.columns)
+overall_recent = None
+if ov_cal:
+    rec = ov_cal[-n_recent:]
+    overall_recent = float(ov_tbl.loc["전체", rec].mean())
+    latest = ov_cal[-1]
+    latest_ap = ap[ap["period"] == latest]
+    delta_txt, delta_sub = "-", "비교할 전년 데이터 없음"
+    if len(ov_cal) >= 2:
+        prev = ov_cal[-2]
+        pct = (ov_tbl.loc["전체", latest] / ov_tbl.loc["전체", prev] - 1) * 100
+        delta_txt = f"{'▲' if pct >= 0 else '▼'} {abs(pct):.1f}%"
+        delta_sub = f"{prev}년 → {latest}년"
+    kpi_row([
+        (f"전체 세대당 사용량 · 최근 {len(rec)}개년 평균", f"{overall_recent:,.0f}", unit_label,
+         f"{rec[0]}~{rec[-1]} · {how}", True),
+        ("직전 연도 대비 증감", delta_txt, "", delta_sub, False),
+        (f"분석 단지 ({latest}년 기준)", f"{latest_ap['apartment_code'].nunique():,}", "개",
+         f"세대수 {latest_ap['hh'].sum():,.0f}", False),
+        ("데이터 최종 월", last_month, "", f"‘{TTM}’은 이 달까지 12개월", False),
+    ])
+else:
+    st.markdown(CSS, unsafe_allow_html=True)
+    st.warning("12개월이 모두 채워진 연도 데이터가 없습니다.")
 
 tab_gu, tab_area, tab_built, tab_search = st.tabs(
     ["구청별", "면적별", "준공연도별", "아파트 검색"]
@@ -329,7 +541,8 @@ tab_gu, tab_area, tab_built, tab_search = st.tabs(
 
 # ── 구청별 ───────────────────────────────────────────────────
 with tab_gu:
-    render_group_tab(ap, "sigungu", how, n_recent, unit_label, key="gu")
+    render_group_tab(ap, "sigungu", how, n_recent, unit_label, key="gu",
+                     sort_by_value=True, overall=overall_recent)
 
 # ── 면적별 ───────────────────────────────────────────────────
 with tab_area:
@@ -338,14 +551,14 @@ with tab_area:
         "(사용량 테이블이 단지 단위라 세대별 면적과 직접 연결할 수 없음)."
     )
     render_group_tab(ap, "area_band", how, n_recent, unit_label,
-                     order=AREA_LABELS + [AREA_NONE], key="area")
+                     order=AREA_LABELS + [AREA_NONE], key="area", overall=overall_recent)
 
 # ── 준공연도별 ───────────────────────────────────────────────
 with tab_built:
     mode = st.radio("묶음 단위", ["10년 단위(연대)", "5년 단위", "연도별"], horizontal=True)
     ap_b = ap.copy()
     ap_b["built_grp"] = make_built_group(ap_b["built_year"], mode)
-    render_group_tab(ap_b, "built_grp", how, n_recent, unit_label, key="built")
+    render_group_tab(ap_b, "built_grp", how, n_recent, unit_label, key="built", overall=overall_recent)
 
 # ── 아파트 검색 ──────────────────────────────────────────────
 with tab_search:
@@ -370,15 +583,17 @@ with tab_search:
 
         cand["label"] = cand.apply(label, axis=1)
         picked = st.multiselect(
-            f"검색 결과 {len(cand)}건 — 비교할 단지 선택", cand["label"].tolist(),
-            default=cand["label"].tolist()[:1],
+            f"검색 결과 {len(cand)}건 — 비교할 단지 선택 (최대 8개)", cand["label"].tolist(),
+            default=cand["label"].tolist()[:1], max_selections=len(SERIES),
         )
         codes = cand[cand["label"].isin(picked)]["apartment_code"].tolist()
 
         if codes:
             names = master.set_index("apartment_code")["apartment_name"]
+            disp = {c: f"{names[c]} ({c})" for c in codes}
+            slots = {disp[c]: SERIES[i] for i, c in enumerate(codes)}  # 선택 순서대로 고정 배정
             sel = ap_all[ap_all["apartment_code"].isin(codes)].copy()
-            sel["단지"] = sel["apartment_code"].map(names) + " (" + sel["apartment_code"] + ")"
+            sel["단지"] = sel["apartment_code"].map(disp)
 
             # 연도별 표
             pv = sel.pivot_table(index="단지", columns="period", values="per_hh", aggfunc="first")
@@ -390,14 +605,18 @@ with tab_search:
                 if len(cal) >= 3:
                     tbl[f"3개년 이동평균({cal[-1]})"] = pv[cal].T.rolling(3, min_periods=3).mean().T[cal[-1]]
 
-            st.markdown(f"**연도별 세대당 사용량** · {unit_label}")
+            chart_title("연도별 세대당 사용량", unit_label)
             if tbl.empty or not cal:
                 st.warning("선택한 단지는 12개월이 모두 채워진 연도가 없습니다.")
             else:
+                if len(codes) == 1:
+                    one = pv.loc[disp[codes[0]], cal].dropna()
+                    bdf = pd.DataFrame({"그룹": [f"{c}년" for c in one.index], "값": one.values})
+                    show_alt(bar_chart(bdf, unit_label))
+                else:
+                    gl = pv[cal].reset_index().melt(id_vars="단지", var_name="연도", value_name="값").dropna()
+                    show_alt(grouped_bar_chart(gl, unit_label, slots))
                 show_df(fmt_table(tbl))
-                yearly = pv[cal].T
-                yearly.index.name = "연도"
-                st.bar_chart(yearly, height=300)
 
             # 비교 기준(같은 구 / 같은 면적대 / 같은 준공 연대)
             if cal:
@@ -415,8 +634,7 @@ with tab_search:
                 for code in codes:
                     r = mi.loc[code]
                     dec = make_built_group(pd.Series([r["built_year"]]), "10년 단위(연대)").iloc[0]
-                    own = pv.loc[names[code] + " (" + code + ")", recent].mean() if (
-                        names[code] + " (" + code + ")") in pv.index else np.nan
+                    own = pv.loc[disp[code], recent].mean() if disp[code] in pv.index else np.nan
 
                     def ref(key, grp):
                         t = tabs_by[key]
@@ -425,7 +643,7 @@ with tab_search:
 
                     g_gu, g_ar, g_de = ref("sigungu", r["sigungu"]), ref("area_band", r["area_band"]), ref("decade", dec)
                     rows.append({
-                        "단지": f"{names[code]} ({code})",
+                        "단지": disp[code],
                         "이 단지": own,
                         f"{r['sigungu']} 평균": g_gu,
                         f"면적대 평균({r['area_band']})": g_ar,
@@ -436,14 +654,15 @@ with tab_search:
                 show_df(cmp_df.style.format("{:,.1f}", na_rep="-"))
 
             # 월별 추이
-            st.markdown(f"**월별 세대당 사용량** · {unit}/세대/월 (선택한 상품 합산)")
+            chart_title("월별 세대당 사용량", f"{unit}/세대/월 · 선택한 상품 합산 · 점에 마우스를 올리면 값이 보입니다")
             mf = fact[fact["apartment_code"].isin(codes)]
             mm = mf.groupby(["apartment_code", "sales_ym"], as_index=False).agg(
                 u=(val_col, "sum"), c=("metered_row_cnt", "sum")
             )
-            mm["per_hh"] = mm["u"] / mm["c"]
-            mm["단지"] = mm["apartment_code"].map(names) + " (" + mm["apartment_code"] + ")"
-            st.line_chart(mm.pivot_table(index="sales_ym", columns="단지", values="per_hh"), height=300)
+            mm["값"] = mm["u"] / mm["c"]
+            mm["단지"] = mm["apartment_code"].map(disp)
+            mm = mm.rename(columns={"sales_ym": "월"})[["월", "단지", "값"]]
+            show_alt(monthly_chart(mm, f"{unit}/세대/월", slots))
 
             info = master[master["apartment_code"].isin(codes)][
                 ["apartment_code", "apartment_name", "sigungu", "address", "built_year", "households", "units", "avg_area", "area_band"]
