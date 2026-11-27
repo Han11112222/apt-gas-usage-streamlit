@@ -226,6 +226,22 @@ def get_client() -> bigquery.Client:
     return bigquery.Client(project=PROJECT)
 
 
+@st.cache_data(ttl=3600, show_spinner="평형 구성을 불러오는 중...")
+def load_pyeong() -> pd.DataFrame:
+    sql = f"""
+    SELECT apartment_code,
+      CASE WHEN pyeong IS NULL THEN '미등록'
+           WHEN pyeong < 30 THEN '20평형'
+           WHEN pyeong < 40 THEN '30평형'
+           WHEN pyeong < 50 THEN '40평형'
+           ELSE '50평형 이상' END AS band,
+      COUNT(*) AS hh
+    FROM `{DATASET}.pbi_ref_apt_unit_area`
+    GROUP BY 1, 2
+    """
+    return get_client().query(sql).to_dataframe()
+
+
 @st.cache_data(ttl=3600, show_spinner="BigQuery에서 사용량 데이터를 불러오는 중...")
 def load_fact() -> pd.DataFrame:
     sql = f"""
@@ -624,6 +640,40 @@ def render_apartments(codes):
     mm = mm.rename(columns={"sales_ym": "월"})[["월", "단지", "값"]]
     show_alt(monthly_chart(mm, f"{unit}/세대/월", slots))
 
+    # 평형별 구성
+    PY = ["20평형", "30평형", "40평형", "50평형 이상", "미등록"]
+    try:
+        pyd = load_pyeong()
+    except Exception:
+        pyd = pd.DataFrame(columns=["apartment_code", "band", "hh"])
+    pyd = pyd[pyd["apartment_code"].isin(codes)]
+    if not pyd.empty:
+        chart_title("평형별 세대 구성", "공급평형 기준(20평형=30평 미만, 30평형=30~39평, 40평형=40~49평) · 사용량이 아니라 세대수입니다")
+        pick_py = st.segmented_control("평형 선택", ["전체"] + PY[:4], default="전체", key="py_pick") \
+            if hasattr(st, "segmented_control") else "전체"
+        pick_py = pick_py or "전체"
+        pt = pyd.pivot_table(index="band", columns="apartment_code", values="hh", aggfunc="sum").reindex(PY).fillna(0)
+        pt.columns = [disp[c] for c in pt.columns]
+        tot = pt.sum()
+        shown = pt if pick_py == "전체" else pt.loc[[pick_py]]
+        out = shown.copy().astype(int)
+        for c in pt.columns:
+            out[f"{c} 비중(%)"] = (shown[c] / tot[c] * 100).round(1) if tot[c] else np.nan
+        out.index.name = "평형"
+        show_df(out.style.format("{:,.0f}", subset=[c for c in out.columns if "비중" not in c]).format("{:.1f}", subset=[c for c in out.columns if "비중" in c], na_rep="-"))
+        long = shown.reset_index().melt(id_vars="band", var_name="단지", value_name="세대수")
+        long = long[long["세대수"] > 0]
+        if not long.empty:
+            show_alt(
+                alt.Chart(long).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, size=24).encode(
+                    x=alt.X("band:N", sort=PY, title=None, axis=alt.Axis(labelAngle=0)),
+                    xOffset="단지:N", y=alt.Y("세대수:Q", title="세대수"),
+                    color=alt.Color("단지:N", scale=alt.Scale(domain=list(slots), range=list(slots.values())), legend=alt.Legend(orient="bottom", title=None)),
+                    tooltip=["단지:N", "band:N", alt.Tooltip("세대수:Q", format=",")],
+                ).properties(height=240, background=SURFACE).configure_view(stroke=None))
+        st.caption("※ 가스 사용량은 단지 단위로만 집계되어 평형별 사용량은 계산할 수 없습니다. "
+                   "평형별 사용량이 필요하면 호(세대)별 검침 데이터가 BigQuery에 추가되어야 합니다.")
+
     info = master[master["apartment_code"].isin(codes)][
         ["apartment_code", "apartment_name", "sigungu", "address", "built_year", "households", "units", "avg_area", "area_band"]
     ].rename(columns={
@@ -654,6 +704,43 @@ def selected_map_code():
         return None
 
 
+def selected_alt_code():
+    ev = st.session_state.get("apt_map_alt")
+    try:
+        rows = ev["selection"]["pick"]
+        return rows[0].get("apartment_code") if rows else None
+    except Exception:
+        return None
+
+
+def render_simple_map(m, sel_code, nb, ramp):
+    """WebGL 없이 그리는 위도·경도 산점도 (클릭으로 단지 선택)."""
+    pick = alt.selection_point(name="pick", fields=["apartment_code"], on="click", toggle=False)
+    d = m[["apartment_code", "단지", "구", "준공", "값_txt", "lat", "lon", "bin"]].copy()
+    d["선택"] = d["apartment_code"] == sel_code
+    chart = (
+        alt.Chart(d)
+        .mark_circle(stroke="#191919")
+        .encode(
+            x=alt.X("lon:Q", scale=alt.Scale(zero=False, nice=False), axis=None),
+            y=alt.Y("lat:Q", scale=alt.Scale(zero=False, nice=False), axis=None),
+            color=alt.Color("bin:O", scale=alt.Scale(domain=list(range(nb)), range=ramp), legend=None),
+            size=alt.condition("datum['선택']", alt.value(260), alt.value(55)),
+            strokeWidth=alt.condition("datum['선택']", alt.value(3), alt.value(0)),
+            opacity=alt.value(0.85),
+            tooltip=[alt.Tooltip("단지:N"), alt.Tooltip("구:N"), alt.Tooltip("준공:N"), alt.Tooltip("값_txt:N", title="세대당")],
+        )
+        .add_params(pick)
+        .properties(height=520, background="#f4f6f8")
+        .configure_view(stroke=None)
+    )
+    try:
+        st.altair_chart(chart, theme=None, on_select="rerun", key="apt_map_alt", width="stretch")
+    except TypeError:
+        st.altair_chart(chart, theme=None, use_container_width=True)
+        st.caption("이 Streamlit 버전에서는 클릭 선택을 지원하지 않습니다. 아래 검색을 이용하세요.")
+
+
 def render_map_tab():
     cal_all = calendar_cols(ap["period"].unique())
     if not cal_all:
@@ -682,39 +769,49 @@ def render_map_tab():
     chart_title(f"단지별 세대당 사용량 지도 · 최근 {len(recent)}개년 평균({recent[0]}~{recent[-1]})",
                 "점을 클릭하면 아래에 그 단지의 사용량이 표시됩니다 · 색이 진할수록 사용량이 많음")
 
-    sel_code = selected_map_code()
+    mode = st.radio("지도 방식", ["간단 지도 (모든 브라우저)", "배경지도 (WebGL 필요)"], horizontal=True,
+                    key="map_mode", help="배경지도가 보이지 않으면 간단 지도를 사용하세요.")
+    simple = mode.startswith("간단")
+    if simple:
+        sel_code = selected_alt_code()
+    else:
+        sel_code = selected_map_code()
     if sel_code not in set(m["apartment_code"]):
         sel_code = None
 
-    layers = [pdk.Layer(
-        "ScatterplotLayer", id="apts",
-        data=m[["apartment_code", "단지", "구", "준공", "값_txt", "lat", "lon", "color"]],
-        get_position="[lon, lat]", get_fill_color="color", get_radius=70,
-        radius_min_pixels=4, radius_max_pixels=14, pickable=True, auto_highlight=True,
-        highlight_color=[25, 25, 25, 90],
-    )]
-    if sel_code:
-        layers.append(pdk.Layer(
-            "ScatterplotLayer", id="picked", data=m[m["apartment_code"] == sel_code][["lat", "lon"]],
-            get_position="[lon, lat]", filled=False, stroked=True, get_line_color=[25, 25, 25, 255],
-            line_width_min_pixels=3, get_radius=70, radius_min_pixels=11, radius_max_pixels=20,
-            pickable=False,
-        ))
-    deck = pdk.Deck(
-        layers=layers,
-        initial_view_state=pdk.ViewState(latitude=float(m["lat"].mean()), longitude=float(m["lon"].mean()),
-                                         zoom=10.5, pitch=0),
-        tooltip={"html": "<b>{단지}</b><br>{구} · 준공 {준공}<br>세대당 {값_txt}",
-                 "style": {"backgroundColor": "#191919", "color": "#ffffff", "fontSize": "13px",
-                           "padding": "8px 10px", "borderRadius": "6px"}},
-        map_style=MAP_STYLE,
-    )
-    try:
-        st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key="apt_map",
-                        width="stretch", height=520)
-    except TypeError:  # 구버전 Streamlit: 클릭 선택 없이 지도만 표시
-        st.pydeck_chart(deck)
-        st.caption("이 Streamlit 버전에서는 지도 클릭 선택을 지원하지 않습니다. 아래 검색을 이용하세요.")
+    if simple:
+        render_simple_map(m, sel_code, nb, ramp)
+    else:
+
+        layers = [pdk.Layer(
+            "ScatterplotLayer", id="apts",
+            data=m[["apartment_code", "단지", "구", "준공", "값_txt", "lat", "lon", "color"]],
+            get_position="[lon, lat]", get_fill_color="color", get_radius=70,
+            radius_min_pixels=4, radius_max_pixels=14, pickable=True, auto_highlight=True,
+            highlight_color=[25, 25, 25, 90],
+        )]
+        if sel_code:
+            layers.append(pdk.Layer(
+                "ScatterplotLayer", id="picked", data=m[m["apartment_code"] == sel_code][["lat", "lon"]],
+                get_position="[lon, lat]", filled=False, stroked=True, get_line_color=[25, 25, 25, 255],
+                line_width_min_pixels=3, get_radius=70, radius_min_pixels=11, radius_max_pixels=20,
+                pickable=False,
+            ))
+        deck = pdk.Deck(
+            layers=layers,
+            initial_view_state=pdk.ViewState(latitude=float(m["lat"].mean()), longitude=float(m["lon"].mean()),
+                                             zoom=10.5, pitch=0),
+            tooltip={"html": "<b>{단지}</b><br>{구} · 준공 {준공}<br>세대당 {값_txt}",
+                     "style": {"backgroundColor": "#191919", "color": "#ffffff", "fontSize": "13px",
+                               "padding": "8px 10px", "borderRadius": "6px"}},
+            map_style=MAP_STYLE,
+        )
+        try:
+            st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key="apt_map",
+                            width="stretch", height=520)
+        except TypeError:  # 구버전 Streamlit: 클릭 선택 없이 지도만 표시
+            st.pydeck_chart(deck)
+            st.caption("이 Streamlit 버전에서는 지도 클릭 선택을 지원하지 않습니다. 아래 검색을 이용하세요.")
 
     # 범례 (단계별 값 범위)
     parts = []
