@@ -766,11 +766,11 @@ def render_map_tab():
         path = [[float(x), float(y)] for x, y in zip(road["lon"], road["lat"])]
         mid = path[len(path) // 2]
         layers.append(pdk.Layer("PathLayer", id="road", data=[{"path": path}], get_path="path",
-                                get_color=[217, 72, 15, 220], width_min_pixels=4, get_width=30,
+                                get_color=[244, 162, 97, 170], width_min_pixels=4, get_width=30,
                                 pickable=False))
         labels = [{"pos": path[int(len(path) * f)], "t": "달구벌대로"} for f in (0.15, 0.5, 0.85)]
         layers.append(pdk.Layer("TextLayer", id="road_label", data=labels, get_position="pos",
-                                get_text="t", get_size=14, get_color=[217, 72, 15, 255],
+                                get_text="t", get_size=14, get_color=[214, 122, 52, 255],
                                 get_text_anchor="'middle'", get_alignment_baseline="'bottom'",
                                 font_family="'Malgun Gothic','Noto Sans KR',sans-serif",
                                 font_weight=700, outline_width=3, outline_color=[255, 255, 255, 230],
