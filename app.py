@@ -736,17 +736,23 @@ def render_map_tab():
         st.info("지도에서 점을 클릭하거나 위에서 이름으로 찾으세요.")
 
 
-tab_gu, tab_area, tab_built, tab_map, tab_search = st.tabs(
-    ["구청별", "면적별", "준공연도별", "지도", "아파트 검색"]
-)
+# 탭 대신 '보기 선택'을 쓴다: 선택한 화면만 그려서, 숨겨진 탭 안에서 지도가 빈 화면으로
+# 나오는 문제를 피하고 화면 전환도 빨라진다.
+VIEWS = ["구청별", "면적별", "준공연도별", "지도", "아파트 검색"]
+try:
+    view = st.segmented_control("보기", VIEWS, default=VIEWS[0], key="view", label_visibility="collapsed")
+except AttributeError:  # 구버전 Streamlit
+    view = st.radio("보기", VIEWS, horizontal=True, key="view", label_visibility="collapsed")
+view = view or VIEWS[0]
+st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
 # ── 구청별 ───────────────────────────────────────────────────
-with tab_gu:
+if view == "구청별":
     render_group_tab(ap, "sigungu", how, n_recent, unit_label, key="gu",
                      sort_by_value=True, overall=overall_recent)
 
 # ── 면적별 ───────────────────────────────────────────────────
-with tab_area:
+if view == "면적별":
     st.caption(
         "면적대는 단지 내 세대별 전용면적의 평균으로 단지를 분류한 값입니다 "
         "(사용량 테이블이 단지 단위라 세대별 면적과 직접 연결할 수 없음)."
@@ -755,18 +761,18 @@ with tab_area:
                      order=AREA_LABELS + [AREA_NONE], key="area", overall=overall_recent)
 
 # ── 준공연도별 ───────────────────────────────────────────────
-with tab_built:
+if view == "준공연도별":
     mode = st.radio("묶음 단위", ["10년 단위(연대)", "5년 단위", "연도별"], horizontal=True)
     ap_b = ap.copy()
     ap_b["built_grp"] = make_built_group(ap_b["built_year"], mode)
     render_group_tab(ap_b, "built_grp", how, n_recent, unit_label, key="built", overall=overall_recent)
 
 # ── 지도 ─────────────────────────────────────────────────────
-with tab_map:
+if view == "지도":
     render_map_tab()
 
 # ── 아파트 검색 ──────────────────────────────────────────────
-with tab_search:
+if view == "아파트 검색":
     kw = st.text_input("아파트명 검색 (일부만 입력해도 됨)", placeholder="예: 범어, 센트럴, 푸르지오")
     cand = master[master["apartment_code"].isin(ap_all["apartment_code"].unique())]
     if kw.strip():
