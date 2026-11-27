@@ -704,41 +704,28 @@ def selected_map_code():
         return None
 
 
-def selected_alt_code():
-    ev = st.session_state.get("apt_map_alt")
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_road(name: str = "달구벌대로") -> pd.DataFrame:
+    """도로명주소 좌표에서 도로 중심선(서→동)을 근사해 만든다."""
+    sql = f"""
+    SELECT lon, lat FROM `{DATASET}.pbi_ref_addr_geo`
+    WHERE REGEXP_CONTAINS(address, r'{name} [0-9]+(-[0-9]+)?$') AND lat IS NOT NULL AND lon IS NOT NULL
+    """
+    d = get_client().query(sql).to_dataframe()
+    if d.empty:
+        return d
+    d["lon"] = pd.to_numeric(d["lon"]); d["lat"] = pd.to_numeric(d["lat"])
+    d["bin"] = (d["lon"] / 0.004).round()
+    line = d.groupby("bin").agg(lon=("lon", "median"), lat=("lat", "median"), n=("lon", "size"))
+    line = line[line["n"] >= 2].sort_values("lon").reset_index(drop=True)
+    return line[["lon", "lat"]]
+
+
+def load_road_safe():
     try:
-        rows = ev["selection"]["pick"]
-        return rows[0].get("apartment_code") if rows else None
+        return load_road()
     except Exception:
-        return None
-
-
-def render_simple_map(m, sel_code, nb, ramp):
-    """WebGL 없이 그리는 위도·경도 산점도 (클릭으로 단지 선택)."""
-    pick = alt.selection_point(name="pick", fields=["apartment_code"], on="click", toggle=False)
-    d = m[["apartment_code", "단지", "구", "준공", "값_txt", "lat", "lon", "bin"]].copy()
-    d["선택"] = d["apartment_code"] == sel_code
-    chart = (
-        alt.Chart(d)
-        .mark_circle(stroke="#191919")
-        .encode(
-            x=alt.X("lon:Q", scale=alt.Scale(zero=False, nice=False), axis=None),
-            y=alt.Y("lat:Q", scale=alt.Scale(zero=False, nice=False), axis=None),
-            color=alt.Color("bin:O", scale=alt.Scale(domain=list(range(nb)), range=ramp), legend=None),
-            size=alt.condition("datum['선택']", alt.value(260), alt.value(55)),
-            strokeWidth=alt.condition("datum['선택']", alt.value(3), alt.value(0)),
-            opacity=alt.value(0.85),
-            tooltip=[alt.Tooltip("단지:N"), alt.Tooltip("구:N"), alt.Tooltip("준공:N"), alt.Tooltip("값_txt:N", title="세대당")],
-        )
-        .add_params(pick)
-        .properties(height=520, background="#f4f6f8")
-        .configure_view(stroke=None)
-    )
-    try:
-        st.altair_chart(chart, theme=None, on_select="rerun", key="apt_map_alt", width="stretch")
-    except TypeError:
-        st.altair_chart(chart, theme=None, use_container_width=True)
-        st.caption("이 Streamlit 버전에서는 클릭 선택을 지원하지 않습니다. 아래 검색을 이용하세요.")
+        return pd.DataFrame(columns=["lon", "lat"])
 
 
 def render_map_tab():
@@ -767,51 +754,56 @@ def render_map_tab():
     m["값_txt"] = m["값"].map(lambda v: f"{v:,.1f} {unit_label}")
 
     chart_title(f"단지별 세대당 사용량 지도 · 최근 {len(recent)}개년 평균({recent[0]}~{recent[-1]})",
-                "점을 클릭하면 아래에 그 단지의 사용량이 표시됩니다 · 색이 진할수록 사용량이 많음")
+                "점을 클릭하면 아래에 그 단지의 사용량이 표시됩니다 · 색이 진할수록 사용량이 많음 · 주황색 선은 달구벌대로")
 
-    mode = st.radio("지도 방식", ["배경지도 (WebGL 필요)", "간단 지도 (모든 브라우저)"], horizontal=True,
-                    key="map_mode", help="배경지도가 보이지 않으면 간단 지도를 사용하세요.")
-    simple = mode.startswith("간단")
-    if simple:
-        sel_code = selected_alt_code()
-    else:
-        sel_code = selected_map_code()
+    sel_code = selected_map_code()
     if sel_code not in set(m["apartment_code"]):
         sel_code = None
 
-    if simple:
-        render_simple_map(m, sel_code, nb, ramp)
-    else:
-
-        layers = [pdk.Layer(
-            "ScatterplotLayer", id="apts",
-            data=m[["apartment_code", "단지", "구", "준공", "값_txt", "lat", "lon", "color"]],
-            get_position="[lon, lat]", get_fill_color="color", get_radius=70,
-            radius_min_pixels=4, radius_max_pixels=14, pickable=True, auto_highlight=True,
-            highlight_color=[25, 25, 25, 90],
-        )]
-        if sel_code:
-            layers.append(pdk.Layer(
-                "ScatterplotLayer", id="picked", data=m[m["apartment_code"] == sel_code][["lat", "lon"]],
-                get_position="[lon, lat]", filled=False, stroked=True, get_line_color=[25, 25, 25, 255],
-                line_width_min_pixels=3, get_radius=70, radius_min_pixels=11, radius_max_pixels=20,
-                pickable=False,
-            ))
-        deck = pdk.Deck(
-            layers=layers,
-            initial_view_state=pdk.ViewState(latitude=float(m["lat"].mean()), longitude=float(m["lon"].mean()),
-                                             zoom=10.5, pitch=0),
-            tooltip={"html": "<b>{단지}</b><br>{구} · 준공 {준공}<br>세대당 {값_txt}",
-                     "style": {"backgroundColor": "#191919", "color": "#ffffff", "fontSize": "13px",
-                               "padding": "8px 10px", "borderRadius": "6px"}},
-            map_style=MAP_STYLE,
-        )
-        try:
-            st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key="apt_map",
-                            width="stretch", height=520)
-        except TypeError:  # 구버전 Streamlit: 클릭 선택 없이 지도만 표시
-            st.pydeck_chart(deck)
-            st.caption("이 Streamlit 버전에서는 지도 클릭 선택을 지원하지 않습니다. 아래 검색을 이용하세요.")
+    layers = []
+    road = load_road_safe()
+    if len(road) >= 2:
+        path = [[float(x), float(y)] for x, y in zip(road["lon"], road["lat"])]
+        mid = path[len(path) // 2]
+        layers.append(pdk.Layer("PathLayer", id="road", data=[{"path": path}], get_path="path",
+                                get_color=[217, 72, 15, 220], width_min_pixels=4, get_width=30,
+                                pickable=False))
+        labels = [{"pos": path[int(len(path) * f)], "t": "달구벌대로"} for f in (0.15, 0.5, 0.85)]
+        layers.append(pdk.Layer("TextLayer", id="road_label", data=labels, get_position="pos",
+                                get_text="t", get_size=14, get_color=[217, 72, 15, 255],
+                                get_text_anchor="'middle'", get_alignment_baseline="'bottom'",
+                                font_family="'Malgun Gothic','Noto Sans KR',sans-serif",
+                                font_weight=700, outline_width=3, outline_color=[255, 255, 255, 230],
+                                background=False, billboard=True))
+    layers.append(pdk.Layer(
+        "ScatterplotLayer", id="apts",
+        data=m[["apartment_code", "단지", "구", "준공", "값_txt", "lat", "lon", "color"]],
+        get_position="[lon, lat]", get_fill_color="color", get_radius=70,
+        radius_min_pixels=4, radius_max_pixels=14, pickable=True, auto_highlight=True,
+        highlight_color=[25, 25, 25, 90],
+    ))
+    if sel_code:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", id="picked", data=m[m["apartment_code"] == sel_code][["lat", "lon"]],
+            get_position="[lon, lat]", filled=False, stroked=True, get_line_color=[25, 25, 25, 255],
+            line_width_min_pixels=3, get_radius=70, radius_min_pixels=11, radius_max_pixels=20,
+            pickable=False,
+        ))
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(latitude=float(m["lat"].mean()), longitude=float(m["lon"].mean()),
+                                         zoom=10.5, pitch=0),
+        tooltip={"html": "<b>{단지}</b><br>{구} · 준공 {준공}<br>세대당 {값_txt}",
+                 "style": {"backgroundColor": "#191919", "color": "#ffffff", "fontSize": "13px",
+                           "padding": "8px 10px", "borderRadius": "6px"}},
+        map_style=MAP_STYLE,
+    )
+    try:
+        st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key="apt_map",
+                        width="stretch", height=520)
+    except TypeError:  # 구버전 Streamlit: 클릭 선택 없이 지도만 표시
+        st.pydeck_chart(deck)
+        st.caption("이 Streamlit 버전에서는 지도 클릭 선택을 지원하지 않습니다. 아래 검색을 이용하세요.")
 
     # 범례 (단계별 값 범위)
     parts = []
