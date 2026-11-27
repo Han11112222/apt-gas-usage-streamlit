@@ -769,7 +769,7 @@ def render_map_tab():
     chart_title(f"단지별 세대당 사용량 지도 · 최근 {len(recent)}개년 평균({recent[0]}~{recent[-1]})",
                 "점을 클릭하면 아래에 그 단지의 사용량이 표시됩니다 · 색이 진할수록 사용량이 많음")
 
-    mode = st.radio("지도 방식", ["간단 지도 (모든 브라우저)", "배경지도 (WebGL 필요)"], horizontal=True,
+    mode = st.radio("지도 방식", ["배경지도 (WebGL 필요)", "간단 지도 (모든 브라우저)"], horizontal=True,
                     key="map_mode", help="배경지도가 보이지 않으면 간단 지도를 사용하세요.")
     simple = mode.startswith("간단")
     if simple:
@@ -842,7 +842,7 @@ def render_map_tab():
 
 # 탭 대신 '보기 선택'을 쓴다: 선택한 화면만 그려서, 숨겨진 탭 안에서 지도가 빈 화면으로
 # 나오는 문제를 피하고 화면 전환도 빨라진다.
-VIEWS = ["구청별", "면적별", "준공연도별", "지도", "아파트 검색"]
+VIEWS = ["구청별", "면적별", "준공연도별", "아파트 검색"]
 try:
     view = st.segmented_control("보기", VIEWS, default=VIEWS[0], key="view", label_visibility="collapsed")
 except AttributeError:  # 구버전 Streamlit
@@ -854,6 +854,8 @@ st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 if view == "구청별":
     render_group_tab(ap, "sigungu", how, n_recent, unit_label, key="gu",
                      sort_by_value=True, overall=overall_recent)
+    st.divider()
+    render_map_tab()
 
 # ── 면적별 ───────────────────────────────────────────────────
 if view == "면적별":
@@ -870,10 +872,6 @@ if view == "준공연도별":
     ap_b = ap.copy()
     ap_b["built_grp"] = make_built_group(ap_b["built_year"], mode)
     render_group_tab(ap_b, "built_grp", how, n_recent, unit_label, key="built", overall=overall_recent)
-
-# ── 지도 ─────────────────────────────────────────────────────
-if view == "지도":
-    render_map_tab()
 
 # ── 아파트 검색 ──────────────────────────────────────────────
 if view == "아파트 검색":
