@@ -12,6 +12,7 @@
 import altair as alt
 import numpy as np
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -243,7 +244,7 @@ def load_fact() -> pd.DataFrame:
 def load_master() -> pd.DataFrame:
     sql = f"""
     SELECT d.apartment_code, d.apartment_name, d.sigungu,
-           b.built_year, a.avg_area, a.units, i.households, i.address
+           b.built_year, a.avg_area, a.units, i.households, i.address, i.lat, i.lon
     FROM `{DATASET}.pbi_dim_apartment` d
     LEFT JOIN (
         SELECT apartment_code, ANY_VALUE(built_year) AS built_year
@@ -256,7 +257,7 @@ def load_master() -> pd.DataFrame:
     ) a USING (apartment_code)
     LEFT JOIN (
         SELECT apartment_code, ANY_VALUE(households) AS households,
-               ANY_VALUE(address) AS address
+               ANY_VALUE(address) AS address, ANY_VALUE(lat) AS lat, ANY_VALUE(lon) AS lon
         FROM `{DATASET}.pbi_ref_apt_info` GROUP BY 1
     ) i USING (apartment_code)
     """
@@ -264,6 +265,8 @@ def load_master() -> pd.DataFrame:
     m = m.drop_duplicates("apartment_code").reset_index(drop=True)
     m["built_year"] = pd.to_numeric(m["built_year"], errors="coerce")
     m["avg_area"] = pd.to_numeric(m["avg_area"], errors="coerce")
+    m["lat"] = pd.to_numeric(m["lat"], errors="coerce")
+    m["lon"] = pd.to_numeric(m["lon"], errors="coerce")
     band = pd.cut(m["avg_area"], bins=AREA_BINS, labels=AREA_LABELS, right=True)
     m["area_band"] = band.astype(object).where(m["avg_area"].notna(), AREA_NONE)
     return m
@@ -535,8 +538,206 @@ else:
     st.markdown(CSS, unsafe_allow_html=True)
     st.warning("12개월이 모두 채워진 연도 데이터가 없습니다.")
 
-tab_gu, tab_area, tab_built, tab_search = st.tabs(
-    ["구청별", "면적별", "준공연도별", "아파트 검색"]
+
+
+# ── 단지 상세 (검색 탭·지도 탭 공용) ─────────────────────────
+def render_apartments(codes):
+    names = master.set_index("apartment_code")["apartment_name"]
+    disp = {c: f"{names[c]} ({c})" for c in codes}
+    slots = {disp[c]: SERIES[i] for i, c in enumerate(codes)}  # 선택 순서대로 고정 배정
+    sel = ap_all[ap_all["apartment_code"].isin(codes)].copy()
+    sel["단지"] = sel["apartment_code"].map(disp)
+
+    # 연도별 표
+    pv = sel.pivot_table(index="단지", columns="period", values="per_hh", aggfunc="first")
+    cal = calendar_cols(pv.columns)
+    tbl = pv[cal + ([TTM] if TTM in pv.columns else [])].copy()
+    if cal:
+        recent = cal[-n_recent:]
+        tbl[f"최근{len(recent)}개년 평균({recent[0]}~{recent[-1]})"] = pv[recent].mean(axis=1)
+        if len(cal) >= 3:
+            tbl[f"3개년 이동평균({cal[-1]})"] = pv[cal].T.rolling(3, min_periods=3).mean().T[cal[-1]]
+
+    chart_title("연도별 세대당 사용량", unit_label)
+    if tbl.empty or not cal:
+        st.warning("선택한 단지는 12개월이 모두 채워진 연도가 없습니다.")
+    else:
+        if len(codes) == 1:
+            one = pv.loc[disp[codes[0]], cal].dropna()
+            bdf = pd.DataFrame({"그룹": [f"{c}년" for c in one.index], "값": one.values})
+            show_alt(bar_chart(bdf, unit_label))
+        else:
+            gl = pv[cal].reset_index().melt(id_vars="단지", var_name="연도", value_name="값").dropna()
+            show_alt(grouped_bar_chart(gl, unit_label, slots))
+        show_df(fmt_table(tbl))
+
+    # 비교 기준(같은 구 / 같은 면적대 / 같은 준공 연대)
+    if cal:
+        recent = cal[-n_recent:]
+        st.markdown(f"**비교 기준 대비** · 최근 {len(recent)}개년 평균({recent[0]}~{recent[-1]}), {how}")
+        rows = []
+        ap_c = ap_all.copy()
+        ap_c["decade"] = make_built_group(ap_c["built_year"], "10년 단위(연대)")
+        tabs_by = {
+            "sigungu": group_period_table(ap_c, "sigungu", how),
+            "area_band": group_period_table(ap_c, "area_band", how),
+            "decade": group_period_table(ap_c, "decade", how),
+        }
+        mi = master.set_index("apartment_code")
+        for code in codes:
+            r = mi.loc[code]
+            dec = make_built_group(pd.Series([r["built_year"]]), "10년 단위(연대)").iloc[0]
+            own = pv.loc[disp[code], recent].mean() if disp[code] in pv.index else np.nan
+
+            def ref(key, grp):
+                t = tabs_by[key]
+                cols = [c for c in recent if c in t.columns]
+                return t.loc[grp, cols].mean() if grp in t.index and cols else np.nan
+
+            g_gu, g_ar, g_de = ref("sigungu", r["sigungu"]), ref("area_band", r["area_band"]), ref("decade", dec)
+            rows.append({
+                "단지": disp[code],
+                "이 단지": own,
+                f"{r['sigungu']} 평균": g_gu,
+                f"면적대 평균({r['area_band']})": g_ar,
+                f"준공 연대 평균({dec})": g_de,
+                "구 평균 대비(%)": (own / g_gu - 1) * 100 if pd.notna(own) and pd.notna(g_gu) else np.nan,
+            })
+        cmp_df = pd.DataFrame(rows).set_index("단지")
+        show_df(cmp_df.style.format("{:,.1f}", na_rep="-"))
+
+    # 월별 추이
+    chart_title("월별 세대당 사용량", f"{unit}/세대/월 · 선택한 상품 합산 · 점에 마우스를 올리면 값이 보입니다")
+    mf = fact[fact["apartment_code"].isin(codes)]
+    mm = mf.groupby(["apartment_code", "sales_ym"], as_index=False).agg(
+        u=(val_col, "sum"), c=("metered_row_cnt", "sum")
+    )
+    mm["값"] = mm["u"] / mm["c"]
+    mm["단지"] = mm["apartment_code"].map(disp)
+    mm = mm.rename(columns={"sales_ym": "월"})[["월", "단지", "값"]]
+    show_alt(monthly_chart(mm, f"{unit}/세대/월", slots))
+
+    info = master[master["apartment_code"].isin(codes)][
+        ["apartment_code", "apartment_name", "sigungu", "address", "built_year", "households", "units", "avg_area", "area_band"]
+    ].rename(columns={
+        "apartment_code": "코드", "apartment_name": "단지명", "sigungu": "구·군", "address": "주소",
+        "built_year": "준공연도", "households": "세대수(정보)", "units": "세대수(면적등록)",
+        "avg_area": "평균 전용면적(㎡)", "area_band": "면적대",
+    })
+    with st.expander("단지 기본 정보"):
+        show_df(info, hide_index=True)
+
+
+# ── 지도 ─────────────────────────────────────────────────────
+MAP_RAMP = ["#84b9f3", "#519ced", "#257de0", "#1b64be", "#0f4a96"]  # 한 가지 파랑, 연함 → 진함
+MAP_STYLE = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
+
+
+def hex_rgb(h: str, a: int = 230) -> list:
+    return [int(h[i:i + 2], 16) for i in (1, 3, 5)] + [a]
+
+
+def selected_map_code():
+    """지도에서 클릭한 단지의 코드 (없으면 None). 위젯 상태에서 읽는다."""
+    state = st.session_state.get("apt_map")
+    try:
+        objs = (state["selection"]["objects"] or {}).get("apts") or []
+        return objs[0].get("apartment_code") if objs else None
+    except Exception:
+        return None
+
+
+def render_map_tab():
+    cal_all = calendar_cols(ap["period"].unique())
+    if not cal_all:
+        st.warning("12개월이 모두 채워진 연도 데이터가 없습니다.")
+        return
+    recent = cal_all[-n_recent:]
+    val = (ap[ap["period"].isin(recent)].groupby("apartment_code")["per_hh"].mean()
+           .rename("값").reset_index())
+    m = master.merge(val, on="apartment_code", how="inner").dropna(subset=["lat", "lon"]).copy()
+    if m.empty:
+        st.info("지도에 표시할 단지가 없습니다. 상품·구·군 선택을 확인하세요.")
+        return
+
+    # 값이 비슷한 단지끼리 5단계로 묶어 한 가지 파랑의 농도로 표시
+    codes_q = pd.qcut(m["값"], 5, labels=False, duplicates="drop")
+    nb = int(codes_q.max()) + 1
+    picks = np.linspace(0, len(MAP_RAMP) - 1, nb).round().astype(int)
+    ramp = [MAP_RAMP[i] for i in picks]
+    m["bin"] = codes_q.astype(int)
+    m["color"] = m["bin"].map(lambda b: hex_rgb(ramp[b]))
+    m["단지"] = m["apartment_name"].fillna("-")
+    m["구"] = m["sigungu"].fillna("-")
+    m["준공"] = m["built_year"].map(lambda y: f"{int(y)}년" if pd.notna(y) else "미상")
+    m["값_txt"] = m["값"].map(lambda v: f"{v:,.1f} {unit_label}")
+
+    chart_title(f"단지별 세대당 사용량 지도 · 최근 {len(recent)}개년 평균({recent[0]}~{recent[-1]})",
+                "점을 클릭하면 아래에 그 단지의 사용량이 표시됩니다 · 색이 진할수록 사용량이 많음")
+
+    sel_code = selected_map_code()
+    if sel_code not in set(m["apartment_code"]):
+        sel_code = None
+
+    layers = [pdk.Layer(
+        "ScatterplotLayer", id="apts",
+        data=m[["apartment_code", "단지", "구", "준공", "값_txt", "lat", "lon", "color"]],
+        get_position="[lon, lat]", get_fill_color="color", get_radius=70,
+        radius_min_pixels=4, radius_max_pixels=14, pickable=True, auto_highlight=True,
+        highlight_color=[25, 25, 25, 90],
+    )]
+    if sel_code:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", id="picked", data=m[m["apartment_code"] == sel_code][["lat", "lon"]],
+            get_position="[lon, lat]", filled=False, stroked=True, get_line_color=[25, 25, 25, 255],
+            line_width_min_pixels=3, get_radius=70, radius_min_pixels=11, radius_max_pixels=20,
+            pickable=False,
+        ))
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(latitude=float(m["lat"].mean()), longitude=float(m["lon"].mean()),
+                                         zoom=10.5, pitch=0),
+        tooltip={"html": "<b>{단지}</b><br>{구} · 준공 {준공}<br>세대당 {값_txt}",
+                 "style": {"backgroundColor": "#191919", "color": "#ffffff", "fontSize": "13px",
+                           "padding": "8px 10px", "borderRadius": "6px"}},
+        map_style=MAP_STYLE,
+    )
+    try:
+        st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key="apt_map",
+                        width="stretch", height=520)
+    except TypeError:  # 구버전 Streamlit: 클릭 선택 없이 지도만 표시
+        st.pydeck_chart(deck)
+        st.caption("이 Streamlit 버전에서는 지도 클릭 선택을 지원하지 않습니다. 아래 검색을 이용하세요.")
+
+    # 범례 (단계별 값 범위)
+    parts = []
+    for b in range(nb):
+        sub = m[m["bin"] == b]["값"]
+        parts.append(
+            f"<span style='display:inline-flex;align-items:center;margin-right:16px;font-size:12.5px;color:#191919'>"
+            f"<span style='width:12px;height:12px;border-radius:50%;background:{ramp[b]};margin-right:6px'></span>"
+            f"{sub.min():,.0f} ~ {sub.max():,.0f}</span>"
+        )
+    st.markdown("".join(parts) + f"<span style='font-size:12.5px;color:#666'>({unit_label})</span>",
+                unsafe_allow_html=True)
+    st.caption(f"좌표가 있고 12개월 데이터가 있는 단지 {len(m):,}개만 표시됩니다.")
+
+    # 이름으로 찾기 (지도 클릭 대신)
+    labels = {f"{r.단지} · {r.구} ({r.apartment_code})": r.apartment_code for r in m.sort_values(["구", "단지"]).itertuples()}
+    pick = st.selectbox("또는 이름으로 찾기", ["(지도에서 선택)"] + list(labels.keys()), key="map_pick")
+    code = labels.get(pick, sel_code)
+    if code:
+        st.divider()
+        row = m[m["apartment_code"] == code].iloc[0]
+        st.subheader(f"🏢 {row['단지']}")
+        st.caption(f"{row['구']} · 준공 {row['준공']} · {row['값_txt']} (최근 {len(recent)}개년 평균)")
+        render_apartments([code])
+    else:
+        st.info("지도에서 점을 클릭하거나 위에서 이름으로 찾으세요.")
+
+
+tab_gu, tab_area, tab_built, tab_map, tab_search = st.tabs(
+    ["구청별", "면적별", "준공연도별", "지도", "아파트 검색"]
 )
 
 # ── 구청별 ───────────────────────────────────────────────────
@@ -559,6 +760,10 @@ with tab_built:
     ap_b = ap.copy()
     ap_b["built_grp"] = make_built_group(ap_b["built_year"], mode)
     render_group_tab(ap_b, "built_grp", how, n_recent, unit_label, key="built", overall=overall_recent)
+
+# ── 지도 ─────────────────────────────────────────────────────
+with tab_map:
+    render_map_tab()
 
 # ── 아파트 검색 ──────────────────────────────────────────────
 with tab_search:
@@ -587,89 +792,5 @@ with tab_search:
             default=cand["label"].tolist()[:1], max_selections=len(SERIES),
         )
         codes = cand[cand["label"].isin(picked)]["apartment_code"].tolist()
-
         if codes:
-            names = master.set_index("apartment_code")["apartment_name"]
-            disp = {c: f"{names[c]} ({c})" for c in codes}
-            slots = {disp[c]: SERIES[i] for i, c in enumerate(codes)}  # 선택 순서대로 고정 배정
-            sel = ap_all[ap_all["apartment_code"].isin(codes)].copy()
-            sel["단지"] = sel["apartment_code"].map(disp)
-
-            # 연도별 표
-            pv = sel.pivot_table(index="단지", columns="period", values="per_hh", aggfunc="first")
-            cal = calendar_cols(pv.columns)
-            tbl = pv[cal + ([TTM] if TTM in pv.columns else [])].copy()
-            if cal:
-                recent = cal[-n_recent:]
-                tbl[f"최근{len(recent)}개년 평균({recent[0]}~{recent[-1]})"] = pv[recent].mean(axis=1)
-                if len(cal) >= 3:
-                    tbl[f"3개년 이동평균({cal[-1]})"] = pv[cal].T.rolling(3, min_periods=3).mean().T[cal[-1]]
-
-            chart_title("연도별 세대당 사용량", unit_label)
-            if tbl.empty or not cal:
-                st.warning("선택한 단지는 12개월이 모두 채워진 연도가 없습니다.")
-            else:
-                if len(codes) == 1:
-                    one = pv.loc[disp[codes[0]], cal].dropna()
-                    bdf = pd.DataFrame({"그룹": [f"{c}년" for c in one.index], "값": one.values})
-                    show_alt(bar_chart(bdf, unit_label))
-                else:
-                    gl = pv[cal].reset_index().melt(id_vars="단지", var_name="연도", value_name="값").dropna()
-                    show_alt(grouped_bar_chart(gl, unit_label, slots))
-                show_df(fmt_table(tbl))
-
-            # 비교 기준(같은 구 / 같은 면적대 / 같은 준공 연대)
-            if cal:
-                recent = cal[-n_recent:]
-                st.markdown(f"**비교 기준 대비** · 최근 {len(recent)}개년 평균({recent[0]}~{recent[-1]}), {how}")
-                rows = []
-                ap_c = ap_all.copy()
-                ap_c["decade"] = make_built_group(ap_c["built_year"], "10년 단위(연대)")
-                tabs_by = {
-                    "sigungu": group_period_table(ap_c, "sigungu", how),
-                    "area_band": group_period_table(ap_c, "area_band", how),
-                    "decade": group_period_table(ap_c, "decade", how),
-                }
-                mi = master.set_index("apartment_code")
-                for code in codes:
-                    r = mi.loc[code]
-                    dec = make_built_group(pd.Series([r["built_year"]]), "10년 단위(연대)").iloc[0]
-                    own = pv.loc[disp[code], recent].mean() if disp[code] in pv.index else np.nan
-
-                    def ref(key, grp):
-                        t = tabs_by[key]
-                        cols = [c for c in recent if c in t.columns]
-                        return t.loc[grp, cols].mean() if grp in t.index and cols else np.nan
-
-                    g_gu, g_ar, g_de = ref("sigungu", r["sigungu"]), ref("area_band", r["area_band"]), ref("decade", dec)
-                    rows.append({
-                        "단지": disp[code],
-                        "이 단지": own,
-                        f"{r['sigungu']} 평균": g_gu,
-                        f"면적대 평균({r['area_band']})": g_ar,
-                        f"준공 연대 평균({dec})": g_de,
-                        "구 평균 대비(%)": (own / g_gu - 1) * 100 if pd.notna(own) and pd.notna(g_gu) else np.nan,
-                    })
-                cmp_df = pd.DataFrame(rows).set_index("단지")
-                show_df(cmp_df.style.format("{:,.1f}", na_rep="-"))
-
-            # 월별 추이
-            chart_title("월별 세대당 사용량", f"{unit}/세대/월 · 선택한 상품 합산 · 점에 마우스를 올리면 값이 보입니다")
-            mf = fact[fact["apartment_code"].isin(codes)]
-            mm = mf.groupby(["apartment_code", "sales_ym"], as_index=False).agg(
-                u=(val_col, "sum"), c=("metered_row_cnt", "sum")
-            )
-            mm["값"] = mm["u"] / mm["c"]
-            mm["단지"] = mm["apartment_code"].map(disp)
-            mm = mm.rename(columns={"sales_ym": "월"})[["월", "단지", "값"]]
-            show_alt(monthly_chart(mm, f"{unit}/세대/월", slots))
-
-            info = master[master["apartment_code"].isin(codes)][
-                ["apartment_code", "apartment_name", "sigungu", "address", "built_year", "households", "units", "avg_area", "area_band"]
-            ].rename(columns={
-                "apartment_code": "코드", "apartment_name": "단지명", "sigungu": "구·군", "address": "주소",
-                "built_year": "준공연도", "households": "세대수(정보)", "units": "세대수(면적등록)",
-                "avg_area": "평균 전용면적(㎡)", "area_band": "면적대",
-            })
-            with st.expander("단지 기본 정보"):
-                show_df(info, hide_index=True)
+            render_apartments(codes)
