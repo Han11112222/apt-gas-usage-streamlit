@@ -450,4 +450,7 @@ with tab_search:
             ].rename(columns={
                 "apartment_code": "코드", "apartment_name": "단지명", "sigungu": "구·군", "address": "주소",
                 "built_year": "준공연도", "households": "세대수(정보)", "units": "세대수(면적등록)",
-                "avg_area":
+                "avg_area": "평균 전용면적(㎡)", "area_band": "면적대",
+            })
+            with st.expander("단지 기본 정보"):
+                show_df(info, hide_index=True)
