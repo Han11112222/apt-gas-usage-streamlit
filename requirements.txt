@@ -1,6 +1,7 @@
 streamlit
 pandas
 altair>=5
+pydeck
 google-cloud-bigquery
 db-dtypes
 pyarrow
