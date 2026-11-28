@@ -505,6 +505,11 @@ with st.sidebar:
     )
     sel_products = [p for p in fact_all["product"].unique()
                     if p.split("/", 1)[-1] in sel_usages and p.split("/", 1)[0] in sel_cats]
+    hh_vals = pd.to_numeric(master["households"], errors="coerce").dropna()
+    hh_cap = int(min(3000, max(500, (hh_vals.max() // 100) * 100))) if len(hh_vals) else 2000
+    min_hh = st.slider("세대기준 (이상)", 0, hh_cap, 0, step=100, format="%d세대 이상",
+                       help="단지 세대수가 이 값 이상인 단지만 집계합니다. 0이면 전체 "
+                            "(세대수 정보가 없는 단지는 0일 때만 포함).")
     sigungus = sorted(master["sigungu"].dropna().unique())
     sel_sigungu = st.multiselect("구·군 (비우면 전체)", sigungus)
 
@@ -527,10 +532,12 @@ unit_label = f"{unit}/세대/{'월' if per_month else '년'}"
 fact = fact_all[fact_all["product"].isin(sel_products)]
 ap_all = build_apt_period(fact, val_col, per_month)
 ap_all = ap_all.merge(master, on="apartment_code", how="inner")
+if min_hh > 0:
+    ap_all = ap_all[pd.to_numeric(ap_all["households"], errors="coerce") >= min_hh]
 ap = ap_all[ap_all["sigungu"].isin(sel_sigungu)] if sel_sigungu else ap_all
 
 if ap.empty:
-    st.warning("조건에 맞는 데이터가 없습니다. 상품·구·군 선택을 확인하세요.")
+    st.warning("조건에 맞는 데이터가 없습니다. 상품·구·군·세대기준 선택을 확인하세요.")
     st.stop()
 
 # ── 요약 카드 ────────────────────────────────────────────────
