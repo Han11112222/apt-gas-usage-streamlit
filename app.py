@@ -505,13 +505,39 @@ with st.sidebar:
     )
     sel_products = [p for p in fact_all["product"].unique()
                     if p.split("/", 1)[-1] in sel_usages and p.split("/", 1)[0] in sel_cats]
+    st.divider()
+    st.subheader("세부 조건")
+    st.caption("여러 조건을 함께 고르면 모두 만족하는 단지만 집계합니다. (예: 수성구 · 준공 최근 10년 · 85㎡ 이상)")
+    sigungus = sorted(master["sigungu"].dropna().unique())
+    sel_sigungu = st.multiselect("구·군 (비우면 전체)", sigungus)
+
+    by_vals = pd.to_numeric(master["built_year"], errors="coerce").dropna()
+    by_max = int(by_vals.max()) if len(by_vals) else pd.Timestamp.today().year
+    by_min = int(by_vals.min()) if len(by_vals) else 1970
+    built_mode = st.selectbox(
+        "준공 시기", ["전체", "최근 5년 이내", "최근 10년 이내", "최근 15년 이내", "최근 20년 이내", "직접 선택"],
+        help="기준은 가장 최근 준공연도입니다. 준공연도를 모르는 단지는 ‘전체’일 때만 포함됩니다.",
+    )
+    if built_mode == "직접 선택":
+        by_lo, by_hi = st.slider("준공연도 범위", by_min, by_max, (by_min, by_max), step=1)
+    elif built_mode == "전체":
+        by_lo, by_hi = None, None
+    else:
+        by_lo, by_hi = by_max - int(built_mode.split()[1].rstrip("년")) + 1, by_max
+
+    area_opts = AREA_LABELS + [AREA_NONE]
+    sel_areas = st.multiselect(
+        "면적대 (평형)", area_opts,
+        help="단지 내 세대별 전용면적의 평균으로 분류합니다. 비우면 전체. "
+             "대략 40㎡≈12평, 60㎡≈18평, 85㎡≈25평(33평형), 102㎡≈31평, 135㎡≈41평.",
+    )
+
     hh_vals = pd.to_numeric(master["households"], errors="coerce").dropna()
     hh_cap = int(min(3000, max(500, (hh_vals.max() // 100) * 100))) if len(hh_vals) else 2000
     min_hh = st.slider("세대기준 (이상)", 0, hh_cap, 0, step=100, format="%d세대 이상",
                        help="단지 세대수가 이 값 이상인 단지만 집계합니다. 0이면 전체 "
                             "(세대수 정보가 없는 단지는 0일 때만 포함).")
-    sigungus = sorted(master["sigungu"].dropna().unique())
-    sel_sigungu = st.multiselect("구·군 (비우면 전체)", sigungus)
+    st.divider()
 
     st.caption(
         "연간 값은 해당 연도 12개월이 모두 있는 단지만 계산합니다. "
@@ -534,10 +560,15 @@ ap_all = build_apt_period(fact, val_col, per_month)
 ap_all = ap_all.merge(master, on="apartment_code", how="inner")
 if min_hh > 0:
     ap_all = ap_all[pd.to_numeric(ap_all["households"], errors="coerce") >= min_hh]
+if by_lo is not None:
+    _by = pd.to_numeric(ap_all["built_year"], errors="coerce")
+    ap_all = ap_all[(_by >= by_lo) & (_by <= by_hi)]
+if sel_areas:
+    ap_all = ap_all[ap_all["area_band"].isin(sel_areas)]
 ap = ap_all[ap_all["sigungu"].isin(sel_sigungu)] if sel_sigungu else ap_all
 
 if ap.empty:
-    st.warning("조건에 맞는 데이터가 없습니다. 상품·구·군·세대기준 선택을 확인하세요.")
+    st.warning("조건에 맞는 데이터가 없습니다. 세부 조건(구·군, 준공 시기, 면적대, 세대기준)을 확인하세요.")
     st.stop()
 
 # ── 요약 카드 ────────────────────────────────────────────────
