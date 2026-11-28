@@ -511,26 +511,25 @@ with st.sidebar:
     sigungus = sorted(master["sigungu"].dropna().unique())
     sel_sigungu = st.multiselect("구·군 (비우면 전체)", sigungus)
 
-    by_vals = pd.to_numeric(master["built_year"], errors="coerce").dropna()
-    by_max = int(by_vals.max()) if len(by_vals) else pd.Timestamp.today().year
-    by_min = int(by_vals.min()) if len(by_vals) else 1970
-    built_mode = st.selectbox(
-        "준공 시기", ["전체", "최근 5년 이내", "최근 10년 이내", "최근 15년 이내", "최근 20년 이내", "직접 선택"],
-        help="기준은 가장 최근 준공연도입니다. 준공연도를 모르는 단지는 ‘전체’일 때만 포함됩니다.",
+    BY_MIN = 1980
+    BY_MAX = max(pd.Timestamp.today().year, int(pd.to_numeric(master["built_year"], errors="coerce").max() or 0))
+    by_lo, by_hi = st.slider(
+        "준공연도 (바를 좌우로 조정)", BY_MIN, BY_MAX, (BY_MIN, BY_MAX), step=1,
+        help="기본(1980~현재 전체)에서는 준공연도를 모르는 단지와 1980년 이전 단지까지 모두 포함합니다. "
+             "바를 움직이면 그 범위에 준공된 단지만 집계합니다.",
     )
-    if built_mode == "직접 선택":
-        by_lo, by_hi = st.slider("준공연도 범위", by_min, by_max, (by_min, by_max), step=1)
-    elif built_mode == "전체":
+    if (by_lo, by_hi) == (BY_MIN, BY_MAX):
         by_lo, by_hi = None, None
-    else:
-        by_lo, by_hi = by_max - int(built_mode.split()[1].rstrip("년")) + 1, by_max
 
     area_opts = AREA_LABELS + [AREA_NONE]
     sel_areas = st.multiselect(
-        "면적대 (평형)", area_opts,
-        help="단지 내 세대별 전용면적의 평균으로 분류합니다. 비우면 전체. "
-             "대략 40㎡≈12평, 60㎡≈18평, 85㎡≈25평(33평형), 102㎡≈31평, 135㎡≈41평.",
+        "면적대 (전용면적 기준)", area_opts,
+        help="공급면적이 아니라 ‘전용면적’(㎡) 기준입니다. 단지 내 세대별 전용면적의 평균으로 단지를 분류합니다. "
+             "비우면 전체. 공급평형으로 대략 환산하면 40㎡ 이하≈20평형 미만, 40~60㎡≈20평형대, "
+             "60~85㎡≈25~34평형, 85~102㎡≈34~40평형, 102~135㎡≈40평형대, 135㎡ 초과≈50평형 이상입니다 "
+             "(단지마다 차이가 있는 대략값).",
     )
+    st.caption("면적대는 전용면적(㎡) 기준 · 평형은 공급평형 기준(아파트 검색의 ‘평형별 세대 구성’)")
 
     hh_vals = pd.to_numeric(master["households"], errors="coerce").dropna()
     hh_cap = int(min(3000, max(500, (hh_vals.max() // 100) * 100))) if len(hh_vals) else 2000
@@ -918,7 +917,7 @@ if view == "구청별":
 # ── 면적별 ───────────────────────────────────────────────────
 if view == "면적별":
     st.caption(
-        "면적대는 단지 내 세대별 전용면적의 평균으로 단지를 분류한 값입니다 "
+        "면적대는 ‘전용면적’(공급면적 아님) 기준으로, 단지 내 세대별 전용면적의 평균으로 단지를 분류한 값입니다 "
         "(사용량 테이블이 단지 단위라 세대별 면적과 직접 연결할 수 없음)."
     )
     render_group_tab(ap, "area_band", how, n_recent, unit_label,
