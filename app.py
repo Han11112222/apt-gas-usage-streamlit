@@ -595,6 +595,34 @@ if ov_cal:
          f"세대수 {latest_ap['hh'].sum():,.0f}", False),
         ("데이터 최종 월", last_month, "", f"‘{TTM}’은 이 달까지 12개월", False),
     ])
+
+    # 분석 단지 전체 목록 (다운로드)
+    lst_codes = latest_ap["apartment_code"].unique()
+    pv_all = ap[ap["apartment_code"].isin(lst_codes)].pivot_table(
+        index="apartment_code", columns="period", values="per_hh", aggfunc="first")
+    cal_cols = [c for c in ov_cal if c in pv_all.columns]
+    out = pv_all[cal_cols + ([TTM] if TTM in pv_all.columns else [])].copy()
+    out.columns = [f"{c}년 {unit_label}" if c in cal_cols else f"{TTM} {unit_label}" for c in out.columns]
+    out[f"최근{len(rec)}개년 평균({rec[0]}~{rec[-1]})"] = pv_all[rec].mean(axis=1)
+    base = master[master["apartment_code"].isin(lst_codes)].set_index("apartment_code")[
+        ["apartment_name", "sigungu", "address", "built_year", "households", "avg_area", "area_band"]
+    ].rename(columns={"apartment_name": "단지명", "sigungu": "구·군", "address": "주소", "built_year": "준공연도",
+                      "households": "세대수(정보)", "avg_area": "평균 전용면적(㎡)", "area_band": "면적대"})
+    hh_last = latest_ap.set_index("apartment_code")["hh"].rename(f"{latest}년 검침 세대수(평균)")
+    listing = base.join(hh_last).join(out).reset_index().rename(columns={"apartment_code": "단지코드"})
+    listing = listing.sort_values(["구·군", "단지명"]).reset_index(drop=True)
+    d1, d2 = st.columns([1, 3])
+    with d1:
+        st.download_button(
+            f"⬇ 분석 단지 {len(listing):,}개 목록 (CSV)",
+            listing.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"분석단지목록_{last_month}.csv", mime="text/csv",
+        )
+    with d2:
+        with st.expander(f"분석 단지 {len(listing):,}개 목록 미리보기"):
+            show_df(listing.style.format(
+                {c: "{:,.1f}" for c in listing.columns if "m³" in c or "MJ" in c or "평균" in c}, na_rep="-"),
+                hide_index=True)
 else:
     st.markdown(CSS, unsafe_allow_html=True)
     st.warning("12개월이 모두 채워진 연도 데이터가 없습니다.")
